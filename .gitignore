@@ -39,3 +39,10 @@ ehthumbs.db
 Thumbs.db
 
 ./data/physionet/
+
+# Large data files
+data/mel_128.h5
+data/*.h5
+saved/
+*.pth
+*.pt
