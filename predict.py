@@ -1,17 +1,171 @@
 import argparse
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import h5py
 import pandas as pd
 from pathlib import Path
 import librosa
 import soundfile
-
-from model.model import VGG_11
-from utils.audio_feature_extractor import LogMelExtractor
-from utils.util import read_audio
+from scipy.signal import butter, lfilter
 
 EPS = 1E-8
+
+# ============================================================================
+# Inlined utility functions
+# ============================================================================
+
+def butter_bandpass(lowcut, hightcut, fs, order=5):
+    nyq = 0.5 * fs
+    low = lowcut / nyq
+    high = hightcut / nyq
+    b, a = butter(order, [low, high], btype='bandpass')
+    return b, a
+
+def butter_bandpass_filter(data, lowcut, hightcut, fs, order=5):
+    b, a = butter_bandpass(lowcut, hightcut, fs, order=order)
+    y = lfilter(b, a, data)
+    return y
+
+def read_audio(path, target_fs=None, filter=False, lowcut=25, hightcut=400):
+    (audio, fs) = soundfile.read(path)
+
+    if audio.ndim > 1:
+        audio = np.mean(audio, axis=1)
+
+    if target_fs is not None and fs != target_fs:
+        audio = librosa.resample(audio, orig_sr=fs, target_sr=target_fs)
+        fs = target_fs
+    if filter:
+        # apply bandpass filter
+        audio = butter_bandpass_filter(audio, lowcut, hightcut, fs)
+    return audio, fs
+
+def LogMelExtractor(data, sr, mel_bins=128, hoplen=15, winlen=25, log=True, snv=False):
+    # define parameters
+    MEL_ARGS = {
+        'n_mels': mel_bins,
+        'sr': sr,
+        'hop_length': int(sr * hoplen / 1000),
+        'win_length': int(sr * winlen / 1000)
+    }
+    mel_spectrogram = librosa.feature.melspectrogram(y=data, **MEL_ARGS)
+    if log:
+        mel_spectrogram = np.log(mel_spectrogram + EPS)
+    if snv:
+        mel_spectrogram = standard_normal_variate(mel_spectrogram)
+    
+    return mel_spectrogram
+
+# ============================================================================
+# Inlined model classes
+# ============================================================================
+
+def init_layer(layer):
+    """Initialize a Linear or Convolutional layer."""
+    nn.init.xavier_uniform_(layer.weight)
+    if hasattr(layer, 'bias'):
+        if layer.bias is not None:
+            layer.bias.data.fill_(0.)
+
+def init_bn(bn):
+    """Initialize a Batchnorm layer."""
+    bn.bias.data.fill_(0.)
+    bn.weight.data.fill_(1.)
+
+class ConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(ConvBlock, self).__init__()
+
+        self.conv1 = nn.Conv2d(in_channels=in_channels,
+                               out_channels=out_channels,
+                               kernel_size=(3, 3),
+                               stride=(1, 1),
+                               padding=(1, 1),
+                               bias=False)
+
+        self.conv2 = nn.Conv2d(in_channels=out_channels,
+                               out_channels=out_channels,
+                               kernel_size=(3, 3),
+                               stride=(1, 1),
+                               padding=(1, 1),
+                               bias=False)
+
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+        self.init_weights()
+
+    def init_weights(self):
+        init_layer(self.conv1)
+        init_layer(self.conv2)
+        init_bn(self.bn1)
+        init_bn(self.bn2)
+
+    def forward(self, input, pool_size=(2, 2), pool_type='max', activation='relu'):
+        x = input
+        x = F.relu_(self.bn1(self.conv1(x)))
+        if activation == 'relu':
+            x = F.relu_(self.bn2(self.conv2(x)))
+        elif activation == 'sigmoid':
+            x = torch.sigmoid(self.bn2(self.conv2(x)))
+
+        if pool_type == 'max':
+            x = F.max_pool2d(x, kernel_size=pool_size)
+        elif pool_type == 'avg':
+            x = F.avg_pool2d(x, kernel_size=pool_size)
+        elif pool_type == 'avg+max':
+            x1 = F.avg_pool2d(x, kernel_size=pool_size)
+            x2 = F.max_pool2d(x, kernel_size=pool_size)
+            x = x1 + x2
+        else:
+            raise Exception('Incorrect argument!')
+        
+        return x
+
+class VGG_11(nn.Module):
+    def __init__(self, num_classes, in_channel):
+        super(VGG_11, self).__init__()
+        self.in_channel = in_channel
+        self.bn0 = nn.BatchNorm2d(128)
+        self.conv1 = ConvBlock(in_channels=in_channel, out_channels=64)
+        self.conv2 = ConvBlock(in_channels=64, out_channels=128)
+        self.conv3 = ConvBlock(in_channels=128, out_channels=256)
+        self.conv4 = ConvBlock(in_channels=256, out_channels=512)
+        self.fc_final = nn.Linear(512, num_classes)
+        self.init_weights()
+
+    def init_weights(self):
+        init_bn(self.bn0)
+        init_layer(self.fc_final)
+
+    def forward(self, input):
+        # (batch_size, 3, mel_bins, time_stamps)
+        B, mel_bins, num_frames = input.size()
+        x = input.view(B, self.in_channel, -1, num_frames)
+        x = x.transpose(1, 2)
+        x = self.bn0(x)
+        x = x.transpose(1, 2)
+
+        # (samples_num, channel, mel_bins, time_stamps)
+        x = self.conv1(x, pool_size=(2, 2), pool_type='max')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv2(x, pool_size=(2, 2), pool_type='max')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv3(x, pool_size=(2, 2), pool_type='max')
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv4(x, pool_size=(2, 2), pool_type='max')
+        x = F.dropout(x, p=0.2, training=self.training)
+        
+        output = F.max_pool2d(x, kernel_size=x.shape[2:])
+        output = output.view(output.shape[0:2])
+        output = F.log_softmax(self.fc_final(output), dim=-1)
+        return output
+
+# ============================================================================
+# Predictor class
+# ============================================================================
 
 def standard_normal_variate(data):
     """Normalize data using standard normal variate"""
